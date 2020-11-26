@@ -11,18 +11,26 @@
 //#include "LiquidCrystal_PCF8574.h"
 #include <stdio.h>
 #include <stdlib.h>
-//#include <exti.h>
+#include <itoa.h>
+
+//#define LIGHTMETER  BH1750
+//#define DHTTYPE DHT11   // DHT 11
+//#define SERIAL_DEBUG 1
+
+#ifdef LIGHTMETER
 #include <BH1750.h>
+#endif
 
+#ifdef DHTTYPE
 #include "DHT.h"
-
-
-#define DHTTYPE DHT11   // DHT 11
 #define DHTPIN PA1     // Digital pin connected to the DHT sensor
+#endif
 
 #define radioSignal PA0
 #define LED_RADIO PA4
-#define SERIAL_DEBUG 1
+#define pinRF24 3
+#define paramButton 4
+
 RTClock rt (RTCSEL_LSE); // initialise
 
 // message id's for STM32 <-> ESP communication
@@ -33,13 +41,11 @@ RTClock rt (RTCSEL_LSE); // initialise
 #define NTP_CHECK_INT (1000*60)*20 //(1000*3600*1)  // six hours
 
 
-#define BMPEP  280
-//#define BMEP  180
-//#define DHT   11
-#define pinRF24 3
-#define paramButton 4
+#define BMPEP  280 //180
 
 
+
+#define DEFAULT_BACKLIGHT 8800
 #if (BMPEP==180) 
   #include <SFE_BMP180.h>
 #endif
@@ -60,25 +66,29 @@ RTClock rt (RTCSEL_LSE); // initialise
 // --------------------------------------------------------
 LiquidCrystal_I2C lcd(0x27,16,2);
 //LiquidCrystal_PCF8574 lcd(0x27);
-
-DHT dht(DHTPIN, DHTTYPE);
+#ifdef DHTTYPE
+#if (DHTTYPE == DHT11)
+DHT dht(DHTPIN, 11);
+#endif
+#endif
 
 uint32_t tt;
 uint32_t prev_ntp_check = 0;
 UARTTransfer UT;
 
-const int analogInPin = PB1; // Analog input pin that the potentiometer
-const int pwmOutPin = PA8;    // PWM pin that the LED is attached to
-// These variables will change:
+#define analogInPin PB1 // Analog input pin that the potentiometer
+#define pwmOutPin PA8    // PWM pin that the LED is attached to
+
+uint16_t backLightValue = 0;        // value output to the PWM
+
+#ifdef LIGHTMETER
 int lightValue = 0;        // value read from the pot
-int backLightValue = 0;        // value output to the PWM
 BH1750 lightMeter;
 uint16_t lux = 0;
-
-// table of brightness levels 
 #define NUM_LEVELS 5
 uint16_t luxlevels[NUM_LEVELS] = {10, 50, 100, 500, 2000};
 uint8_t brightlevels[NUM_LEVELS] = {3, 25, 40, 100, 150};
+#endif
 
 void DisplayTime(DateTime dt);
 void second_isr();
@@ -86,14 +96,20 @@ void radioUp_isr();
 void GetMeteoData();
 void serial_showSensors(String s);
 void CreateStartAck();
-void CreateAck(int pipeNo);
-void showReceiverState(unsigned int pipeNo);
-void showRemoteState(int pipeNo);
-void showRemoteMeteoData(unsigned int pipeNo);
+void CreateAck(uint8_t pipeNo);
+
+void showRemoteMeteoData(uint8_t pipeNo);
 void ShowSecond(DateTime dt);
 void ShowLocalLcdMeteo();
 void ShowRemoteLcdMeteo();
 void pwmBackLight();
+void lcdInitialized();
+void defineI2Cdevices();
+#ifdef SERIAL_DEBUG
+void serial_showSensors(String s);
+void showReceiverState(uint8_t pipeNo);
+void showRemoteState(uint8_t pipeNo);
+#endif 
 
 volatile bool second_flag=true;
 float T,P,H,Ph,H11;
@@ -143,8 +159,13 @@ void setup(void)
   pinMode(pwmOutPin, PWM);
   pinMode(radioSignal,INPUT);
   delay(3000);
+  #ifdef SERIAL_DEBUG 
   Serial.begin(115200);
+  #endif
+
+  #ifdef DHTTYPE
   dht.begin();
+  #endif
   Wire.begin();
 	if(!bme.begin())
 	{
@@ -197,66 +218,22 @@ void setup(void)
   unixtime = tt;
   CreateStartAck();
 
+  #ifdef LIGHTMETER
   lightMeter.begin(); //BH1750_CONTINUOUS_LOW_RES_MODE);
   lux = lightMeter.readLightLevel();
+  #endif
 
-  lcd.init();
-  pwmBackLight();
-  lcd.load_custom_character(0,symD); // Д
-  lcd.load_custom_character(1,symB); // Б
-  lcd.load_custom_character(2,sym4); // Ч
-  lcd.load_custom_character(3,symL); // Л
-  lcd.load_custom_character(4,symP); // П
-  lcd.load_custom_character(5,symSHi); // Щ
-  lcd.load_custom_character(6,symJU); // Ю
-  lcd.load_custom_character(7,symGradus); // Я
-  //lcd.setBacklight(255);
-  //lcd.begin(16,2);
-  lcd.clear();
-  lcd.setCursor(0,0);
-  lcd.print("Start meteo");
-  //delay(2000);
-  //lcd.clear();
-  
-  int nDevices = 0;
-  int address;
-  int error;
-  for (address = 1; address < 127; address++ )
-  {
-    // The i2c_scanner uses the return value of
-    // the Write.endTransmisstion to see if
-    // a device did acknowledge to the address.
-    Wire.beginTransmission(address);
-    error = Wire.endTransmission();
-
-    if (error == 0)
-    {
-      Serial.print("I2C device found at address 0x");
-      if (address < 16)
-        Serial.print("0");
-      Serial.print(address, HEX);
-      Serial.println("  !");
-      nDevices++;
-    }
-    else if (error == 4)
-    {
-      Serial.print("Unknown error at address 0x");
-      if (address < 16)
-        Serial.print("0");
-      Serial.println(address, HEX);
-    }
-  }
-  if (nDevices == 0)
-    Serial.println("No I2C devices found\n");
-  else
-    Serial.println("done\n");
+  lcdInitialized();
+  defineI2Cdevices();
 
   Serial2.begin(9600);
   UT.begin(&Serial2);
   //tt = rt.getTime();
   //DisplayTime(tt);
   GetMeteoData();
+  #ifdef SERIAL_DEBUG
   serial_showSensors("Local data ");
+  #endif
   pinMode(PC13, OUTPUT);
   pinMode(LED_RADIO,OUTPUT);
   digitalWrite(PC13,LOW);
@@ -265,8 +242,6 @@ void setup(void)
   attachInterrupt(0, radioUp_isr, FALLING);
   //digitalPinToInterrupt(PA0)
  }
-
-
 
 void loop() {
 
@@ -289,15 +264,12 @@ void loop() {
       //Serial.print(pipeNo);
       //Serial.print("    ");
       //print_time(clock.getDateTime());
-      #endif
       showRemoteMeteoData(pipeNo);
       showRemoteState(pipeNo);
       showReceiverState(pipeNo);
+      #endif
       CreateAck(pipeNo);
       ShowRemoteLcdMeteo();
-      //strcpy(str1,"#");
-      //lcd.setCursor(0, 0);
-      //lcd.print(str1);
     } 
   if (UT.receiveData()) {
     uint8_t m_id = UT.getMessageID();
@@ -337,8 +309,13 @@ void loop() {
       //DisplayTime(tt);
 
       GetMeteoData();
+      #ifdef SERIAL_DEBUG
       serial_showSensors("Local data ");
+      #endif
     }
+    #ifdef LIGHTMETER
+      lux = lightMeter.readLightLevel();
+    #endif  
   }
   delay(100);
   digitalWrite(PC13,HIGH);
@@ -346,6 +323,23 @@ void loop() {
   //strcpy(str1," ");
   //lcd.setCursor(0, 0);
   //lcd.print(str1);
+}
+void lcdInitialized()
+{
+  lcd.init();
+  pwmBackLight();
+  lcd.load_custom_character(0,symD); // Д
+  lcd.load_custom_character(1,symB); // Б
+  lcd.load_custom_character(2,sym4); // Ч
+  lcd.load_custom_character(3,symL); // Л
+  lcd.load_custom_character(4,symP); // П
+  lcd.load_custom_character(5,symSHi); // Щ
+  lcd.load_custom_character(6,symJU); // Ю
+  lcd.load_custom_character(7,symGradus); // Я
+
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Start meteo");
 }
 void second_isr(){
   second_flag=true;
@@ -375,15 +369,7 @@ void ShowSecond(DateTime dt)
   lcd.setCursor(6,1);
   lcd.print(buffer);
 }
-void pwmBackLight()
-{
-          // read the analog in value:
-    lightValue = analogRead(analogInPin);
-    // map it to the range of the analog out:
-    backLightValue = map(lightValue, 0, 4095, 0, 65535);
-    // change the analog out value:
-    pwmWrite(pwmOutPin, backLightValue);
-}
+
 void DisplayTime(DateTime dt) {
   static uint8_t prev_h = 0;
   static uint8_t prev_m = 0;
@@ -429,6 +415,52 @@ void DisplayTime(DateTime dt) {
   prev_m = m;
   prev_s = s;
 }
+void pwmBackLight()
+{
+  #ifdef LIGHTMETER
+    lightValue = analogRead(analogInPin);
+    backLightValue = map(lightValue, 0, 4095, 0, 65535);
+    pwmWrite(pwmOutPin, backLightValue);
+  #else
+    pwmWrite(pwmOutPin,DEFAULT_BACKLIGHT);
+  #endif
+}
+void defineI2Cdevices()
+  {
+      int nDevices = 0;
+  int address;
+  int error;
+  for (address = 1; address < 127; address++ )
+  {
+    // The i2c_scanner uses the return value of
+    // the Write.endTransmisstion to see if
+    // a device did acknowledge to the address.
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+
+    if (error == 0)
+    {
+      Serial.print("I2C device found at address 0x");
+      if (address < 16)
+        Serial.print("0");
+      Serial.print(address, HEX);
+      Serial.println("  !");
+      nDevices++;
+    }
+    else if (error == 4)
+    {
+      Serial.print("Unknown error at address 0x");
+      if (address < 16)
+        Serial.print("0");
+      Serial.println(address, HEX);
+    }
+  }
+  if (nDevices == 0)
+    Serial.println("No I2C devices found\n");
+  else
+    Serial.println("done\n");
+
+  }
 
 void CreateStartAck()
 {
@@ -444,7 +476,7 @@ void CreateStartAck()
   pipeData.exchange_counter = 0;
   pipeData.pipe_status = start_pipe;
 }
-void CreateAck(int pipeNo)
+void CreateAck(uint8_t pipeNo)
 {
   unixtime = rt.getTime();
   pipeData.ackData.server_time=unixtime-3600;
@@ -456,69 +488,6 @@ void CreateAck(int pipeNo)
   pipeData.ackData.command = none_command; //test_command;
 }
 
-void showReceiverState(unsigned int pipeNo)
-{
-  //  sensors.state=transmit_state;
-  //int channel=radio.getChannel();
-  //int data_rate=radio.getDataRate();
-
-  int power = radio.getPALevel();
-      #if defined(SERIAL_DEBUG) 
-        //выводим на серийный порт
-      Serial.print("Pipe=");
-      Serial.print(pipeNo);
-      Serial.print(" local state   ");
-      tt = rt.getTime();
-      char buffer[255]={0,};
-      dateFormat(buffer,"H:i:s",tt);
-      Serial.print(buffer);
-      Serial.print("  ");
-      Serial.print(pipeData.pipe_status);
-      Serial.print("-");
-      Serial.println(power);  
-      #endif
-}
-void showRemoteState(int pipeNo)
-{
-  #if defined(SERIAL_DEBUG) 
-        //выводим на серийный порт
-      //Serial.print("Pipe=");
-      //Serial.print(pipeNo);
-      Serial.print("Remote data "); 
-      Serial.print(" Query:");
-      Serial.print(receivedData.query);
-      Serial.print(" TypeOfData:");
-      Serial.print(receivedData.type_of_data);
-      Serial.print(" State:");
-      Serial.print(receivedData.state);
-      Serial.print(" Power:");
-      Serial.print(receivedData.power);
-      Serial.print("    ");
-      uint32_t dt = receivedData.client_time;
-      char str[10];
-      unixtimeToString(dt,str);
-      Serial.print(str);
-      Serial.print(" delay:");
-      Serial.print(receivedData.round_tripDelay);  
-      Serial.print(" Vcc=");
-      Serial.println(receivedData.vcc);
-      //Serial.print(F("Loaded next response "));
-      //Serial.println(receivedData[pipeNo].query);  
-  #endif
-}
-void showRemoteMeteoData(unsigned int pipeNo)
-{
-  #if defined(SERIAL_DEBUG) 
-        //выводим на серийный порт
-      Serial.print("Remote meteo T=");
-      Serial.print(receivedData.meteo_data.T);
-      Serial.print("   P=");
-      Serial.print(receivedData.meteo_data.P);
-      Serial.print("   H=");
-      Serial.println(receivedData.meteo_data.H);
-      delay(50);
-  #endif
-}
 void ShowLocalLcdMeteo()
 {
   int row = 1;
@@ -587,7 +556,6 @@ void ShowRemoteLcdMeteo()
    lcd.setCursor(14, row);
    lcd.print(str1);
 }
-
 void GetMeteoData()
 {
   #if (BMPEP==180) 
@@ -643,12 +611,33 @@ void GetMeteoData()
   H = hum*10;
   Ph = pres /133.3224;
   #endif
-  #if (DHTTYPE == 11)
+  #ifdef DHTTYPE
     H11 = dht.readHumidity();
   #endif
-  lux = lightMeter.readLightLevel();
 }
+
 #if defined(SERIAL_DEBUG) 
+void showReceiverState(uint8_t pipeNo)
+{
+  //  sensors.state=transmit_state;
+  //int channel=radio.getChannel();
+  //int data_rate=radio.getDataRate();
+      #if defined(SERIAL_DEBUG) 
+      int power = radio.getPALevel();
+        //выводим на серийный порт
+      Serial.print("Pipe=");
+      Serial.print(pipeNo);
+      Serial.print(" local state   ");
+      tt = rt.getTime();
+      char buffer[255]={0,};
+      dateFormat(buffer,"H:i:s",tt);
+      Serial.print(buffer);
+      Serial.print("  ");
+      Serial.print(pipeData.pipe_status);
+      Serial.print("-");
+      Serial.println(power);  
+      #endif
+}
 void  serial_showSensors(String s)
 {
   Serial.print(s);
@@ -665,13 +654,51 @@ void  serial_showSensors(String s)
     Serial.print(H/10,1);
     Serial.print("   H11=");
     Serial.print(H11,1);
+    #ifdef LIGHTMETER
     Serial.print("  lux=");
     Serial.print(lux);  
     Serial.print(" light=");
-    Serial.print(lightValue);  
+    Serial.print(lightValue);
+    #endif  
     Serial.print(" bl=");
     Serial.println(backLightValue);  
 
     delay(50);
+}
+void showRemoteState(uint8_t pipeNo)
+{
+        //выводим на серийный порт
+      //Serial.print("Pipe=");
+      //Serial.print(pipeNo);
+      Serial.print("Remote data "); 
+      Serial.print(" Query:");
+      Serial.print(receivedData.query);
+      Serial.print(" TypeOfData:");
+      Serial.print(receivedData.type_of_data);
+      Serial.print(" State:");
+      Serial.print(receivedData.state);
+      Serial.print(" Power:");
+      Serial.print(receivedData.power);
+      Serial.print("    ");
+      uint32_t dt = receivedData.client_time;
+      char str[10];
+      unixtimeToString(dt,str);
+      Serial.print(str);
+      Serial.print(" delay:");
+      Serial.print(receivedData.round_tripDelay);  
+      Serial.print(" Vcc=");
+      Serial.println(receivedData.vcc);
+      //Serial.print(F("Loaded next response "));
+      //Serial.println(receivedData[pipeNo].query);  
+}
+void showRemoteMeteoData(uint8_t pipeNo)
+{
+      Serial.print("Remote meteo T=");
+      Serial.print(receivedData.meteo_data.T);
+      Serial.print("   P=");
+      Serial.print(receivedData.meteo_data.P);
+      Serial.print("   H=");
+      Serial.println(receivedData.meteo_data.H);
+      delay(50);
 }
 #endif
