@@ -15,7 +15,7 @@
 
 //#define LIGHTMETER  BH1750
 //#define DHTTYPE DHT11   // DHT 11
-//#define SERIAL_DEBUG 1
+#define SERIAL_DEBUG 1
 
 #ifdef LIGHTMETER
 #include <BH1750.h>
@@ -30,6 +30,7 @@
 #define LED_RADIO PA4
 #define pinRF24 3
 #define paramButton 4
+#define pipeCounter 2
 
 RTClock rt (RTCSEL_LSE); // initialise
 
@@ -55,7 +56,7 @@ RTClock rt (RTCSEL_LSE); // initialise
     BME280::OSR_X1,
     BME280::OSR_X1,
     BME280::OSR_X1,
-    BME280::Mode_Forced,
+    BME280::Mode_Normal,
     BME280::StandbyTime_1000ms,
     BME280::Filter_Off,
     BME280::SpiEnable_False,
@@ -101,7 +102,7 @@ void CreateAck(uint8_t pipeNo);
 void showRemoteMeteoData(uint8_t pipeNo);
 void ShowSecond(DateTime dt);
 void ShowLocalLcdMeteo();
-void ShowRemoteLcdMeteo();
+void ShowRemoteLcdMeteo(uint8_t pipeNo);
 void pwmBackLight();
 void lcdInitialized();
 void defineI2Cdevices();
@@ -117,8 +118,8 @@ float T,P,H,Ph,H11;
 
 RF24 radio(9,10);
 
-pipe_data pipeData;
-meteo_data_struct receivedData;
+pipe_data pipeDataAck[pipeCounter]; //Подготовленные к отсылке данные
+meteo_data_struct receivedData[pipeCounter]; //Принятые данные
 
 bool paramMode =false;
 
@@ -130,7 +131,7 @@ const uint32_t max_exchange_interval = 4000;
 uint32_t max_ex_counter = 10;
 uint32_t unixtime = 0;
 
-RF24EventStack evStack;
+RF24EventStack evStack; //Объект, который держит стек радиоприёмов как стек  pipeNo
 
 uint8_t symD[8]   = { 0x07, 0x09, 0x09, 0x09, 0x09, 0x1F, 0x11 }; // Д
 //uint8_t symZH[8]  = { 0x11, 0x15, 0x15, 0x0E, 0x15, 0x15, 0x11 }; // Ж
@@ -142,10 +143,10 @@ uint8_t symSHi[8] = { 0x10, 0x15, 0x15, 0x15, 0x15, 0x1F, 0x03 }; // Щ
 uint8_t symJU[8]  = { 0x11, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E }; // У
 uint8_t symGradus[8]  = { 0x0C, 0x12, 0x12, 0x0C, 0x00, 0x00, 0x00 }; // Я
 
-const uint64_t pipe_addresses[2] = {
+const uint64_t pipe_addresses[pipeCounter+1] = {
 	0xF0F0F0F0D2LL,
 	0xF0F0F0F0E1LL,
-	//0xF0F0F0F0E2LL,
+	0xF0F0F0F0E2LL
 	//0xF0F0F0F0E3LL,
 	//0xF0F0F0F0E4LL,
 	//0xF0F0F0F0E5LL
@@ -189,7 +190,7 @@ void setup(void)
        Serial.println("Found UNKNOWN sensor! Error!");
   }
   radio.begin();
-  radio.setPALevel(RF24_PA_MAX);
+  radio.setPALevel(RF24_PA_HIGH);
   radio.setDataRate(RF24_2MBPS);
   radio.setChannel(106);
 
@@ -202,7 +203,9 @@ void setup(void)
   
   // Open a writing and reading pipe on each radio, with opposite addresses
   radio.openWritingPipe(pipe_addresses[0]);
-  radio.openReadingPipe(1,pipe_addresses[1]);
+  for(int i=0;i<pipeCounter;++i){
+    radio.openReadingPipe(i+1,pipe_addresses[i+1]);
+  }
   //radio.openReadingPipe(2,pipe_addresses[2]);
   
  
@@ -248,14 +251,14 @@ void loop() {
     uint8_t pipeNo,st=0;
 
     paramMode = digitalRead(paramButton)!=0;
-    while (!evStack.isEmpty()){
+    while (!evStack.isEmpty()){  //Если стек не пуст, то идёт обработка приёма
       delay(100);
       digitalWrite(PC13,HIGH);
-      pipeNo = evStack.pop();
-      pipeData.exchange_counter++;
-      if (receivedData.round_tripDelay > max_exchange_interval)
-        pipeData.longer_exchange_counter++;
-      receivedData.client_time += 3600;      
+      pipeNo = evStack.pop(); //Определён очередной pipeNo
+      pipeDataAck[pipeNo].exchange_counter++;
+      if (receivedData[pipeNo].round_tripDelay > max_exchange_interval)
+        pipeDataAck[pipeNo].longer_exchange_counter++;
+      receivedData[pipeNo].client_time += 3600;      
 
       st++; 
       #if defined(SERIAL_DEBUG) 
@@ -269,7 +272,7 @@ void loop() {
       showReceiverState(pipeNo);
       #endif
       CreateAck(pipeNo);
-      ShowRemoteLcdMeteo();
+      ShowRemoteLcdMeteo(pipeNo);
     } 
   if (UT.receiveData()) {
     uint8_t m_id = UT.getMessageID();
@@ -355,9 +358,9 @@ void radioUp_isr()
   while( radio.available(&pipeNo)){              // Read all available payloads
       uint8_t s = radio.getDynamicPayloadSize();
       //Serial.println(s);
-      radio.read( &receivedData, s );    
+      radio.read( &receivedData[pipeNo], s );    
       //radio.flush_tx();  
-      radio.writeAckPayload(1,&pipeData.ackData, sizeof(server_ack )); 
+      radio.writeAckPayload(1,&pipeDataAck[pipeNo].ackData, sizeof(server_ack )); 
       evStack.push(pipeNo); 
       //flagReceiver = pipeNo;    
   }
@@ -464,28 +467,30 @@ void defineI2Cdevices()
 
 void CreateStartAck()
 {
-  pipeData.ackData.command=start_command;
-  pipeData.ackData.time_interval = 0;
-  pipeData.ackData.server_time = unixtime-3600;
-  //ackData.state =transmit_state;
-  pipeData.ackData.channel=radio.getChannel();
-  pipeData.ackData.data_rate=radio.getDataRate();
-  pipeData.ackData.power = radio.getPALevel();
-  pipeData.power_tune = power_lowing;
-  pipeData.longer_exchange_counter =0;
-  pipeData.exchange_counter = 0;
-  pipeData.pipe_status = start_pipe;
+  for(int i=0;i<pipeCounter;++i){
+    pipeDataAck[i].ackData.command=start_command;
+    pipeDataAck[i].ackData.time_interval = 0;
+    pipeDataAck[i].ackData.server_time = unixtime-3600;
+    //ackData.state =transmit_state;
+    pipeDataAck[i].ackData.channel=radio.getChannel();
+    pipeDataAck[i].ackData.data_rate=radio.getDataRate();
+    pipeDataAck[i].ackData.power = radio.getPALevel();
+    pipeDataAck[i].power_tune = power_lowing;
+    pipeDataAck[i].longer_exchange_counter =0;
+    pipeDataAck[i].exchange_counter = 0;
+    pipeDataAck[i].pipe_status = start_pipe;
+  }
 }
 void CreateAck(uint8_t pipeNo)
 {
   unixtime = rt.getTime();
-  pipeData.ackData.server_time=unixtime-3600;
+  pipeDataAck[pipeNo].ackData.server_time=unixtime-3600;
   //uint8_t channel,data_rate,power;
-  pipeData.ackData.command=none_command;
-  pipeData.ackData.channel=radio.getChannel();
-  pipeData.ackData.power = radio.getPALevel();
-  pipeData.pipe_status = connected_pipe;
-  pipeData.ackData.command = none_command; //test_command;
+  pipeDataAck[pipeNo].ackData.command=none_command;
+  pipeDataAck[pipeNo].ackData.channel=radio.getChannel();
+  pipeDataAck[pipeNo].ackData.power = radio.getPALevel();
+  pipeDataAck[pipeNo].pipe_status = connected_pipe;
+  pipeDataAck[pipeNo].ackData.command = none_command; //test_command;
 }
 
 void ShowLocalLcdMeteo()
@@ -523,13 +528,13 @@ void ShowLocalLcdMeteo()
 
    
 }
-void ShowRemoteLcdMeteo()
+void ShowRemoteLcdMeteo(uint8_t pipeNo)
 {
   int row = 0;
   lcd.setCursor(0,row);
   lcd.print("                ");
 
-  dtostrf(receivedData.meteo_data.T/10.0, 5, 1, str1);
+  dtostrf(abs(receivedData[pipeNo].meteo_data.T)/10.0, 5, 1, str1);
    //if (abs(receivedData.meteo_data.T) > 100)
   lcd.setCursor(0, row);
   lcd.print(str1);
@@ -538,13 +543,13 @@ void ShowRemoteLcdMeteo()
   lcd.write(7);
   lcd.print(str1);
   lcd.setCursor(0,row);
-  if (receivedData.meteo_data.T > 0)
+  if (receivedData[pipeNo].meteo_data.T > 0)
       strcpy(str1,"+");
      else
       strcpy(str1,"-");
    lcd.print(str1);
 
-   uint32_t Pr = lroundf(receivedData.meteo_data.P*0.0750062);
+   uint32_t Pr = lroundf(receivedData[pipeNo].meteo_data.P*0.0750062);
    itoa (Pr, str1,10);
    lcd.setCursor(8, row);
    lcd.print(str1);
@@ -552,7 +557,7 @@ void ShowRemoteLcdMeteo()
    lcd.setCursor(11, row);
    lcd.print(str1);
 
-   itoa (lroundf(receivedData.meteo_data.H/10.0), str1,10);
+   itoa (lroundf(receivedData[pipeNo].meteo_data.H/10.0), str1,10);
    lcd.setCursor(14, row);
    lcd.print(str1);
 }
@@ -633,7 +638,7 @@ void showReceiverState(uint8_t pipeNo)
       dateFormat(buffer,"H:i:s",tt);
       Serial.print(buffer);
       Serial.print("  ");
-      Serial.print(pipeData.pipe_status);
+      Serial.print(pipeDataAck[pipeNo].pipe_status);
       Serial.print("-");
       Serial.println(power);  
       #endif
@@ -668,37 +673,37 @@ void  serial_showSensors(String s)
 void showRemoteState(uint8_t pipeNo)
 {
         //выводим на серийный порт
-      //Serial.print("Pipe=");
-      //Serial.print(pipeNo);
+      Serial.print("Pipe=");
+      Serial.print(pipeNo);
       Serial.print("Remote data "); 
       Serial.print(" Query:");
-      Serial.print(receivedData.query);
+      Serial.print(receivedData[pipeNo].query);
       Serial.print(" TypeOfData:");
-      Serial.print(receivedData.type_of_data);
+      Serial.print(receivedData[pipeNo].type_of_data);
       Serial.print(" State:");
-      Serial.print(receivedData.state);
+      Serial.print(receivedData[pipeNo].state);
       Serial.print(" Power:");
-      Serial.print(receivedData.power);
+      Serial.print(receivedData[pipeNo].power);
       Serial.print("    ");
-      uint32_t dt = receivedData.client_time;
+      uint32_t dt = receivedData[pipeNo].client_time;
       char str[10];
       unixtimeToString(dt,str);
       Serial.print(str);
       Serial.print(" delay:");
-      Serial.print(receivedData.round_tripDelay);  
+      Serial.print(receivedData[pipeNo].round_tripDelay);  
       Serial.print(" Vcc=");
-      Serial.println(receivedData.vcc);
+      Serial.println(receivedData[pipeNo].vcc);
       //Serial.print(F("Loaded next response "));
       //Serial.println(receivedData[pipeNo].query);  
 }
 void showRemoteMeteoData(uint8_t pipeNo)
 {
       Serial.print("Remote meteo T=");
-      Serial.print(receivedData.meteo_data.T);
+      Serial.print(receivedData[pipeNo].meteo_data.T);
       Serial.print("   P=");
-      Serial.print(receivedData.meteo_data.P);
+      Serial.print(receivedData[pipeNo].meteo_data.P);
       Serial.print("   H=");
-      Serial.println(receivedData.meteo_data.H);
+      Serial.println(receivedData[pipeNo].meteo_data.H);
       delay(50);
 }
 #endif
