@@ -7,15 +7,13 @@
 //}
 void RF24EventStack::push(uint8_t pipeNo)
 {
+	stack[lastNo]=pipeNo;
 	if (lastNo == sizeof(stack)-1){
-		if (firstNo==0){
-			firstNo = 1;
-		}
 		lastNo=0;
 	}
 	else
 		lastNo++;
-	stack[lastNo]=pipeNo;
+
 }
 uint8_t RF24EventStack::pop()
 {
@@ -30,7 +28,10 @@ bool RF24EventStack::isEmpty()
 {
 	return firstNo == lastNo;
 }
-
+void RF24EventStack::clear()
+{
+	firstNo = lastNo = 0;
+}
 
 void unixtimeToString(uint32_t unixT,char* str)
 {

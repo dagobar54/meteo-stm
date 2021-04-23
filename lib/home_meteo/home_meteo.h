@@ -80,6 +80,7 @@ public:
 	void push(uint8_t pipeNo);
 	uint8_t pop();
 	bool isEmpty();
+	void clear();
 };
 
 void unixtimeToString(uint32_t unixT,char* str);
